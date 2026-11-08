@@ -1,0 +1,1468 @@
+//
+//  SwipePhotoCleaner.swift
+//  清理图片
+//
+
+import SwiftUI
+import Photos
+import AVKit
+import UIKit
+
+@main
+struct SwipePhotoCleanerApp: App {
+    @AppStorage("isDarkMode") private var isDarkMode: Bool = false
+
+    var body: some Scene {
+        WindowGroup {
+            PhotoCleanerMainView()
+                .preferredColorScheme(isDarkMode ? .dark : .light)
+        }
+    }
+}
+
+// MARK: - 浏览排序模式
+enum SortOrder: String, CaseIterable, Identifiable {
+    case ascending = "顺序"
+    case descending = "逆序"
+    case random = "随机"
+
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .ascending: return "arrow.down"
+        case .descending: return "arrow.up"
+        case .random: return "shuffle"
+        }
+    }
+}
+
+// MARK: - 相册分组模型
+struct AlbumItem: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let subtitle: String?
+    let count: Int
+    let coverAsset: PHAsset?
+    let collection: PHAssetCollection?
+    let isUncategorized: Bool
+
+    static func == (lhs: AlbumItem, rhs: AlbumItem) -> Bool {
+        lhs.id == lhs.id && lhs.count == rhs.count && lhs.id == rhs.id
+    }
+}
+
+// MARK: - 操作历史记录（支持连续多步撤回）
+struct SwipeActionRecord {
+    let asset: PHAsset
+    let addedToTrash: Bool
+}
+
+// MARK: - 核心相册管理 ViewModel（后台线程加载，万张照片丝滑不卡顿）
+@MainActor
+final class PhotoCleanerViewModel: ObservableObject {
+    @Published var isLoading: Bool = true
+    @Published var authorizationStatus: PHAuthorizationStatus = .notDetermined
+
+    // 当前展示的照片队列与当前索引
+    @Published var displayAssets: [PHAsset] = []
+    @Published var currentIndex: Int = 0
+
+    // 待删除暂存队列（保持添加顺序）
+    @Published var trashAssets: [PHAsset] = []
+    @Published var actionHistory: [SwipeActionRecord] = []
+
+    // 相册列表与当前选中相册
+    @Published var albums: [AlbumItem] = []
+    @Published var selectedAlbum: AlbumItem?
+
+    // 当前照片是否已收藏（单独状态确保红心点击瞬时响应）
+    @Published var currentIsFavorite: Bool = false
+
+    // 底部提示 Toast（如“已清除 4.2 MB”）
+    @Published var toastMessage: String?
+
+    // 剩余未整理照片数量
+    @Published var unorganizedTotalCount: Int = 0
+
+    // 持久化设置
+    @AppStorage("sortOrder") var sortOrder: SortOrder = .descending
+    @AppStorage("onlyUnorganized") var onlyUnorganized: Bool = true
+    @AppStorage("lastSelectedAlbumID") private var lastSelectedAlbumID: String = "ALL_PHOTOS"
+    @AppStorage("lastViewedAssetID") private var lastViewedAssetID: String = ""
+
+    private let organizedStorageKey = "SwipeCleaner_OrganizedIDs_v1"
+    private var organizedIDSet: Set<String> = []
+    private var uncategorizedIDSet: Set<String> = []
+    private var totalLibraryCount: Int = 0
+
+    let imageManager = PHCachingImageManager()
+    private let impactFeedback = UIImpactFeedbackGenerator(style: .light)
+
+    init() {
+        if let saved = UserDefaults.standard.stringArray(forKey: organizedStorageKey) {
+            organizedIDSet = Set(saved)
+        }
+        impactFeedback.prepare()
+        checkPermissionAndLoad()
+    }
+
+    // 异步持久化已整理记录，避免阻塞主线程或触发全局重绘
+    private func persistOrganizedIDs() {
+        let snapshot = Array(organizedIDSet)
+        let key = organizedStorageKey
+        unorganizedTotalCount = max(0, totalLibraryCount - organizedIDSet.count)
+        Task.detached(priority: .utility) {
+            UserDefaults.standard.set(snapshot, forKey: key)
+        }
+    }
+
+    func markAsOrganized(_ id: String) {
+        organizedIDSet.insert(id)
+        persistOrganizedIDs()
+    }
+
+    func unmarkOrganized(_ id: String) {
+        organizedIDSet.remove(id)
+        persistOrganizedIDs()
+    }
+
+    func resetOrganizedHistory() {
+        organizedIDSet.removeAll()
+        lastViewedAssetID = ""
+        UserDefaults.standard.removeObject(forKey: organizedStorageKey)
+        unorganizedTotalCount = totalLibraryCount
+        Task {
+            await reloadCurrentAlbumAssets()
+        }
+    }
+
+    var currentAsset: PHAsset? {
+        guard displayAssets.indices.contains(currentIndex) else { return nil }
+        return displayAssets[currentIndex]
+    }
+
+    private func syncCurrentState() {
+        if let current = currentAsset {
+            currentIsFavorite = current.isFavorite
+            lastViewedAssetID = current.localIdentifier
+        } else {
+            currentIsFavorite = false
+        }
+    }
+
+    // MARK: - 权限检查与后台加载
+    func checkPermissionAndLoad() {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        authorizationStatus = status
+        if status == .authorized || status == .limited {
+            Task {
+                await fetchAlbumsAndAssets(showFullLoading: true)
+            }
+        } else if status == .notDetermined {
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] newStatus in
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    self.authorizationStatus = newStatus
+                    if newStatus == .authorized || newStatus == .limited {
+                        await self.fetchAlbumsAndAssets(showFullLoading: true)
+                    } else {
+                        self.isLoading = false
+                    }
+                }
+            }
+        } else {
+            isLoading = false
+        }
+    }
+
+    /// 在后台线程扫描相册结构与未分类集合，避免 16000+ 张照片卡死界面
+    func fetchAlbumsAndAssets(showFullLoading: Bool = false) async {
+        if showFullLoading {
+            isLoading = true
+        }
+
+        let resultData = await Task.detached(priority: .userInitiated) { () -> (Int, Set<String>, [AlbumItem]) in
+            let fetchOptions = PHFetchOptions()
+            fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            let allPhotos = PHAsset.fetchAssets(with: fetchOptions)
+            let totalCount = allPhotos.count
+
+            // 1. 扫描所有用户自建相册，记录已归类的照片 ID
+            var categorizedIDs = Set<String>()
+            var userAlbumItems: [AlbumItem] = []
+
+            let userCollections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
+            userCollections.enumerateObjects { collection, _, _ in
+                let assets = PHAsset.fetchAssets(in: collection, options: fetchOptions)
+                if assets.count > 0 {
+                    assets.enumerateObjects { asset, _, _ in
+                        categorizedIDs.insert(asset.localIdentifier)
+                    }
+                    userAlbumItems.append(
+                        AlbumItem(
+                            id: collection.localIdentifier,
+                            title: collection.localizedTitle ?? "未命名相册",
+                            subtitle: nil,
+                            count: assets.count,
+                            coverAsset: assets.firstObject,
+                            collection: collection,
+                            isUncategorized: false
+                        )
+                    )
+                }
+            }
+
+            // 2. 计算“未分类”照片 ID 集合及封面
+            var uncategorizedSet = Set<String>()
+            var firstUncategorizedAsset: PHAsset? = nil
+            allPhotos.enumerateObjects { asset, _, _ in
+                let id = asset.localIdentifier
+                if !categorizedIDs.contains(id) {
+                    uncategorizedSet.insert(id)
+                    if firstUncategorizedAsset == nil {
+                        firstUncategorizedAsset = asset
+                    }
+                }
+            }
+
+            var builtAlbums: [AlbumItem] = []
+
+            // (a) 全部相册
+            builtAlbums.append(
+                AlbumItem(
+                    id: "ALL_PHOTOS",
+                    title: "全部相册",
+                    subtitle: nil,
+                    count: totalCount,
+                    coverAsset: allPhotos.firstObject,
+                    collection: nil,
+                    isUncategorized: false
+                )
+            )
+
+            // (b) 未分类
+            builtAlbums.append(
+                AlbumItem(
+                    id: "UNCATEGORIZED",
+                    title: "未分类",
+                    subtitle: "尚未加入任何自建相册",
+                    count: uncategorizedSet.count,
+                    coverAsset: firstUncategorizedAsset,
+                    collection: nil,
+                    isUncategorized: true
+                )
+            )
+
+            // (c) 系统智能相册（个人收藏、视频、截屏、实况照片）
+            let smartSubtypes: [PHAssetCollectionSubtype] = [
+                .smartAlbumFavorites,
+                .smartAlbumVideos,
+                .smartAlbumScreenshots,
+                .smartAlbumLivePhotos
+            ]
+            for subtype in smartSubtypes {
+                let colResult = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: subtype, options: nil)
+                colResult.enumerateObjects { collection, _, _ in
+                    let assets = PHAsset.fetchAssets(in: collection, options: fetchOptions)
+                    if assets.count > 0 {
+                        builtAlbums.append(
+                            AlbumItem(
+                                id: collection.localIdentifier,
+                                title: collection.localizedTitle ?? "系统相册",
+                                subtitle: nil,
+                                count: assets.count,
+                                coverAsset: assets.firstObject,
+                                collection: collection,
+                                isUncategorized: false
+                            )
+                        )
+                    }
+                }
+            }
+
+            // (d) 用户自建相册（如小红书、QQ、醒图等）
+            builtAlbums.append(contentsOf: userAlbumItems)
+
+            return (totalCount, uncategorizedSet, builtAlbums)
+        }.value
+
+        self.totalLibraryCount = resultData.0
+        self.uncategorizedIDSet = resultData.1
+        self.albums = resultData.2
+        self.unorganizedTotalCount = max(0, totalLibraryCount - organizedIDSet.count)
+
+        if let matched = albums.first(where: { $0.id == lastSelectedAlbumID }) {
+            self.selectedAlbum = matched
+        } else {
+            self.selectedAlbum = albums.first
+        }
+
+        if showFullLoading {
+            await reloadCurrentAlbumAssets()
+            isLoading = false
+        }
+    }
+
+    /// 根据当前相册、排序方式与“仅看未整理”开关在后台刷新照片列表
+    func reloadCurrentAlbumAssets() async {
+        guard let album = selectedAlbum else { return }
+        lastSelectedAlbumID = album.id
+        let rememberedAssetID = lastViewedAssetID
+
+        let currentSort = sortOrder
+        let filterUnorganized = onlyUnorganized
+        let organizedSnapshot = organizedIDSet
+        let uncategorizedSnapshot = uncategorizedIDSet
+        let trashIDSet = Set(trashAssets.map(\.localIdentifier))
+
+        let filteredAssets = await Task.detached(priority: .userInitiated) { () -> [PHAsset] in
+            let fetchOptions = PHFetchOptions()
+            fetchOptions.sortDescriptors = [
+                NSSortDescriptor(key: "creationDate", ascending: currentSort == .ascending)
+            ]
+
+            let fetchResult: PHFetchResult<PHAsset>
+            if album.id == "ALL_PHOTOS" || album.isUncategorized {
+                fetchResult = PHAsset.fetchAssets(with: fetchOptions)
+            } else if let collection = album.collection {
+                fetchResult = PHAsset.fetchAssets(in: collection, options: fetchOptions)
+            } else {
+                fetchResult = PHAsset.fetchAssets(with: fetchOptions)
+            }
+
+            var result: [PHAsset] = []
+            result.reserveCapacity(min(fetchResult.count, 5000))
+
+            fetchResult.enumerateObjects { asset, _, _ in
+                let id = asset.localIdentifier
+                if album.isUncategorized && !uncategorizedSnapshot.contains(id) {
+                    return
+                }
+                if trashIDSet.contains(id) {
+                    return
+                }
+                if filterUnorganized && organizedSnapshot.contains(id) {
+                    return
+                }
+                result.append(asset)
+            }
+
+            if currentSort == .random {
+                result.shuffle()
+            }
+            return result
+        }.value
+
+        self.displayAssets = filteredAssets
+        // 如果之前浏览的照片仍在列表中，自动定位到上次看到的位置
+        if !rememberedAssetID.isEmpty,
+           let savedIndex = filteredAssets.firstIndex(where: { $0.localIdentifier == rememberedAssetID }) {
+            self.currentIndex = savedIndex
+        } else {
+            self.currentIndex = 0
+        }
+        self.syncCurrentState()
+    }
+
+    // MARK: - 手势与按钮交互
+
+    /// 上滑：移入待删除暂存区
+    func swipeUpToDeleteCurrent() {
+        guard let asset = currentAsset else { return }
+        impactFeedback.impactOccurred()
+
+        let id = asset.localIdentifier
+        if !trashAssets.contains(where: { $0.localIdentifier == id }) {
+            trashAssets.append(asset)
+        }
+        markAsOrganized(id)
+        actionHistory.append(SwipeActionRecord(asset: asset, addedToTrash: true))
+
+        displayAssets.remove(at: currentIndex)
+        if currentIndex >= displayAssets.count {
+            currentIndex = max(0, displayAssets.count - 1)
+        }
+        syncCurrentState()
+    }
+
+    /// 左右滑：保留并查看下一张
+    func swipeKeepCurrent() {
+        guard let asset = currentAsset else { return }
+        let id = asset.localIdentifier
+        markAsOrganized(id)
+        actionHistory.append(SwipeActionRecord(asset: asset, addedToTrash: false))
+
+        if onlyUnorganized {
+            displayAssets.remove(at: currentIndex)
+            if currentIndex >= displayAssets.count {
+                currentIndex = max(0, displayAssets.count - 1)
+            }
+        } else if currentIndex < displayAssets.count - 1 {
+            currentIndex += 1
+        }
+        syncCurrentState()
+    }
+
+    /// 撤回上一步操作（支持连续撤回）
+    func undoLastAction() {
+        guard let last = actionHistory.popLast() else { return }
+        impactFeedback.impactOccurred()
+
+        let id = last.asset.localIdentifier
+        unmarkOrganized(id)
+        if last.addedToTrash {
+            trashAssets.removeAll { $0.localIdentifier == id }
+        }
+
+        if !displayAssets.contains(where: { $0.localIdentifier == id }) {
+            let insertPos = min(currentIndex, displayAssets.count)
+            displayAssets.insert(last.asset, at: insertPos)
+            currentIndex = insertPos
+        } else if let idx = displayAssets.firstIndex(where: { $0.localIdentifier == id }) {
+            currentIndex = idx
+        }
+        syncCurrentState()
+    }
+
+    /// 从待删除列表中单独恢复某张照片
+    func restoreFromTrash(_ asset: PHAsset) {
+        impactFeedback.impactOccurred()
+        let id = asset.localIdentifier
+        trashAssets.removeAll { $0.localIdentifier == id }
+        actionHistory.removeAll { $0.asset.localIdentifier == id }
+        unmarkOrganized(id)
+
+        if !displayAssets.contains(where: { $0.localIdentifier == id }) {
+            let insertPos = min(currentIndex, displayAssets.count)
+            displayAssets.insert(asset, at: insertPos)
+            currentIndex = insertPos
+        }
+        syncCurrentState()
+    }
+
+    /// 切换当前照片的系统“个人收藏”状态
+    func toggleFavoriteCurrent() {
+        guard let asset = currentAsset else { return }
+        impactFeedback.impactOccurred()
+
+        let targetState = !currentIsFavorite
+        currentIsFavorite = targetState
+
+        PHPhotoLibrary.shared().performChanges({
+            let request = PHAssetChangeRequest(for: asset)
+            request.isFavorite = targetState
+        }) { [weak self] success, _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                if success {
+                    if let updated = PHAsset.fetchAssets(withLocalIdentifiers: [asset.localIdentifier], options: nil).firstObject,
+                       self.displayAssets.indices.contains(self.currentIndex),
+                       self.displayAssets[self.currentIndex].localIdentifier == asset.localIdentifier {
+                        self.displayAssets[self.currentIndex] = updated
+                        self.currentIsFavorite = updated.isFavorite
+                    }
+                } else {
+                    self.currentIsFavorite = !targetState
+                }
+            }
+        }
+    }
+
+    /// 真正从系统相册批量删除“待删除”队列中的照片（保持当前画面不闪烁、不跳回开头）
+    func commitBatchDeletion(completion: (() -> Void)? = nil) {
+        let assetsToDelete = trashAssets
+        guard !assetsToDelete.isEmpty else { return }
+
+        // 安全估算文件大小（先检查 responds(to:) 防止异常）
+        var totalBytes: Int64 = 0
+        let fileSizeSelector = Selector(("fileSize"))
+        for asset in assetsToDelete {
+            let resources = PHAssetResource.assetResources(for: asset)
+            for res in resources {
+                if res.responds(to: fileSizeSelector),
+                   let size = res.value(forKey: "fileSize") as? Int64 {
+                    totalBytes += size
+                }
+            }
+        }
+
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetChangeRequest.deleteAssets(assetsToDelete as NSArray)
+        }) { [weak self] success, _ in
+            guard success else { return }
+            Task { @MainActor in
+                guard let self = self else { return }
+                let deletedIDs = Set(assetsToDelete.map(\.localIdentifier))
+                self.trashAssets.removeAll()
+                self.actionHistory.removeAll { deletedIDs.contains($0.asset.localIdentifier) }
+
+                let mb = Double(totalBytes) / (1024.0 * 1024.0)
+                if mb >= 0.1 {
+                    self.showToast(String(format: "已清除 %.1f MB", mb))
+                } else {
+                    self.showToast("已清理 \(assetsToDelete.count) 张照片")
+                }
+
+                // 静默刷新相册计数，不打断当前正在浏览的照片卡片
+                await self.fetchAlbumsAndAssets(showFullLoading: false)
+                completion?()
+            }
+        }
+    }
+
+    func jumpToAsset(at index: Int) {
+        guard displayAssets.indices.contains(index) else { return }
+        currentIndex = index
+        syncCurrentState()
+    }
+
+    private func showToast(_ text: String) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            toastMessage = text
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_200_000_000)
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if self.toastMessage == text {
+                        self.toastMessage = nil
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 主界面
+struct PhotoCleanerMainView: View {
+    @StateObject private var vm = PhotoCleanerViewModel()
+    @State private var showSettings = false
+    @State private var showTrashSheet = false
+    @State private var showAlbumGridSheet = false
+    @State private var dragOffset: CGSize = .zero
+
+    private static let dateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy年M月d日"
+        return df
+    }()
+
+    private static let timeFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm"
+        return df
+    }()
+
+    var body: some View {
+        ZStack {
+            Color(UIColor.systemGroupedBackground)
+                .ignoresSafeArea()
+
+            if vm.isLoading {
+                VStack(spacing: 14) {
+                    ProgressView()
+                        .scaleEffect(1.3)
+                    Text("正在整理相册...")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+            } else if vm.authorizationStatus != .authorized && vm.authorizationStatus != .limited {
+                permissionGuideView
+            } else {
+                VStack(spacing: 12) {
+                    topHeaderBar
+                    thumbnailFilmstrip
+                    mainCardArea
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    bottomControlBar
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+            }
+
+            if let toast = vm.toastMessage {
+                VStack {
+                    Spacer()
+                    Text(toast)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 11)
+                        .background(Color.black.opacity(0.82))
+                        .clipShape(Capsule())
+                        .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+                        .padding(.bottom, 92)
+                }
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheetView(vm: vm)
+                .presentationDetents([.medium])
+        }
+        .sheet(isPresented: $showTrashSheet) {
+            TrashQueueSheetView(vm: vm)
+        }
+        .fullScreenCover(isPresented: $showAlbumGridSheet) {
+            AlbumOverviewSheetView(vm: vm)
+        }
+    }
+
+    private var permissionGuideView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "photo.on.rectangle.angled")
+                .font(.system(size: 50))
+                .foregroundColor(.secondary)
+            Text("需要相册访问权限")
+                .font(.headline)
+            Text("请在系统设置中允许访问“完全访问 / 所有照片”，以便浏览、收藏和清理图片。")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 36)
+            Button("打开系统设置") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            .buttonStyle(.borderedProminent)
+        }
+    }
+
+    // MARK: - 1. 顶部导航栏
+    private var topHeaderBar: some View {
+        HStack {
+            Button {
+                showSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(.primary)
+                    .frame(width: 42, height: 42)
+                    .background(Color(UIColor.secondarySystemGroupedBackground))
+                    .clipShape(Circle())
+            }
+
+            Spacer()
+
+            if let asset = vm.currentAsset, let date = asset.creationDate {
+                VStack(spacing: 2) {
+                    Text(Self.dateFormatter.string(from: date))
+                        .font(.system(size: 16, weight: .bold))
+                    Text(Self.timeFormatter.string(from: date))
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Text(vm.selectedAlbum?.title ?? "全部相册")
+                    .font(.system(size: 16, weight: .bold))
+            }
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                if let asset = vm.currentAsset {
+                    Button {
+                        shareAsset(asset)
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.primary)
+                            .frame(width: 40, height: 40)
+                            .background(Color(UIColor.secondarySystemGroupedBackground))
+                            .clipShape(Circle())
+                    }
+                }
+
+                Button {
+                    showAlbumGridSheet = true
+                } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(.primary)
+                        .frame(width: 40, height: 40)
+                        .background(Color(UIColor.secondarySystemGroupedBackground))
+                        .clipShape(Circle())
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    // MARK: - 2. 顶部缩略图胶片条
+    private var thumbnailFilmstrip: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 6) {
+                    ForEach(Array(vm.displayAssets.enumerated()), id: \.element.localIdentifier) { index, asset in
+                        AssetThumbnailView(asset: asset, size: CGSize(width: 44, height: 56))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(index == vm.currentIndex ? Color.primary : Color.clear, lineWidth: 2)
+                            )
+                            .opacity(index == vm.currentIndex ? 1.0 : 0.55)
+                            .id(asset.localIdentifier)
+                            .onTapGesture {
+                                withAnimation(.easeInOut(duration: 0.15)) {
+                                    vm.jumpToAsset(at: index)
+                                }
+                            }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .frame(height: 60)
+            .onChange(of: vm.currentAsset?.localIdentifier) { newID in
+                if let id = newID {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 3. 中间主卡片区（上滑待删 / 左右滑保留 / 双指缩放预览）
+    private var mainCardArea: some View {
+        ZStack {
+            if let asset = vm.currentAsset {
+                ZStack(alignment: .top) {
+                    RoundedRectangle(cornerRadius: 24)
+                        .fill(Color(UIColor.secondarySystemGroupedBackground))
+                        .shadow(color: Color.black.opacity(0.05), radius: 10, x: 0, y: 4)
+
+                    AssetDetailCardContent(asset: asset)
+                        .padding(10)
+                        .clipShape(RoundedRectangle(cornerRadius: 20))
+
+                    if dragOffset.height < -35 {
+                        HStack(spacing: 6) {
+                            Image(systemName: "trash.fill")
+                            Text("松开移入待删除")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.red.opacity(0.9))
+                        .clipShape(Capsule())
+                        .padding(.top, 22)
+                    }
+                }
+                .offset(x: dragOffset.width * 0.45, y: dragOffset.height)
+                .rotationEffect(.degrees(Double(dragOffset.width / 28)))
+                .gesture(
+                    DragGesture(minimumDistance: 16)
+                        .onChanged { value in
+                            dragOffset = value.translation
+                        }
+                        .onEnded { value in
+                            if value.translation.height < -85 {
+                                // 上滑 -> 加入待删除队列
+                                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                                    dragOffset = .zero
+                                    vm.swipeUpToDeleteCurrent()
+                                }
+                            } else if abs(value.translation.width) > 75 || value.translation.height > 90 {
+                                // 左右滑或下滑 -> 保留并看下一张
+                                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                                    dragOffset = .zero
+                                    vm.swipeKeepCurrent()
+                                }
+                            } else {
+                                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                                    dragOffset = .zero
+                                }
+                            }
+                        }
+                )
+            } else {
+                VStack(spacing: 14) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(.green)
+                    Text("当前相册已全部整理完毕")
+                        .font(.headline)
+                    if !vm.trashAssets.isEmpty {
+                        Text("左下角还有 \(vm.trashAssets.count) 张待删除照片未清理")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    } else if vm.onlyUnorganized {
+                        Button("重置未整理记录重新浏览") {
+                            vm.resetOrganizedHistory()
+                        }
+                        .font(.subheadline.weight(.medium))
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(UIColor.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 24))
+            }
+        }
+    }
+
+    // MARK: - 4. 底部操作栏
+    private var bottomControlBar: some View {
+        HStack(spacing: 14) {
+            // 左侧胶囊：批量删除 (N) + 眼睛预览待删除列表
+            HStack(spacing: 0) {
+                Button {
+                    vm.commitBatchDeletion()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 17, weight: .medium))
+                        if !vm.trashAssets.isEmpty {
+                            Text("(\(vm.trashAssets.count))")
+                                .font(.system(size: 15, weight: .semibold))
+                        }
+                    }
+                    .foregroundColor(vm.trashAssets.isEmpty ? .secondary : .primary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .disabled(vm.trashAssets.isEmpty)
+
+                Divider()
+                    .frame(height: 22)
+
+                Button {
+                    showTrashSheet = true
+                } label: {
+                    Image(systemName: "eye")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(.primary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(height: 54)
+            .background(Color(UIColor.secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+
+            // 中间：收藏按钮（同步系统相册）
+            Button {
+                vm.toggleFavoriteCurrent()
+            } label: {
+                Image(systemName: vm.currentIsFavorite ? "heart.fill" : "heart")
+                    .font(.system(size: 23))
+                    .foregroundColor(.primary)
+                    .frame(width: 54, height: 54)
+            }
+            .disabled(vm.currentAsset == nil)
+
+            // 右侧：大撤回按钮
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    vm.undoLastAction()
+                }
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(vm.actionHistory.isEmpty ? .secondary : .primary)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 54)
+                    .background(Color(UIColor.secondarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                    )
+            }
+            .disabled(vm.actionHistory.isEmpty)
+        }
+        .padding(.top, 4)
+    }
+
+    private func shareAsset(_ asset: PHAsset) {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .highQualityFormat
+        vm.imageManager.requestImage(
+            for: asset,
+            targetSize: PHImageManagerMaximumSize,
+            contentMode: .aspectFit,
+            options: options
+        ) { image, _ in
+            guard let img = image else { return }
+            let av = UIActivityViewController(activityItems: [img], applicationActivities: nil)
+            if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+               let rootVC = scene.windows.first?.rootViewController {
+                rootVC.present(av, animated: true)
+            }
+        }
+    }
+}
+
+// MARK: - 待删除预览弹窗（眼睛按钮 👁️）
+struct TrashQueueSheetView: View {
+    @ObservedObject var vm: PhotoCleanerViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 4),
+        GridItem(.flexible(), spacing: 4),
+        GridItem(.flexible(), spacing: 4)
+    ]
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                if vm.trashAssets.isEmpty {
+                    Spacer()
+                    VStack(spacing: 10) {
+                        Image(systemName: "trash.slash")
+                            .font(.system(size: 38))
+                            .foregroundColor(.secondary)
+                        Text("待删除列表为空")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: columns, spacing: 4) {
+                            ForEach(vm.trashAssets, id: \.localIdentifier) { asset in
+                                ZStack(alignment: .topTrailing) {
+                                    AssetThumbnailView(asset: asset, size: CGSize(width: 130, height: 130))
+                                        .frame(height: 125)
+                                        .clipped()
+
+                                    Button {
+                                        withAnimation(.easeInOut(duration: 0.15)) {
+                                            vm.restoreFromTrash(asset)
+                                        }
+                                    } label: {
+                                        Image(systemName: "arrow.uturn.backward")
+                                            .font(.system(size: 13, weight: .bold))
+                                            .foregroundColor(.primary)
+                                            .frame(width: 28, height: 28)
+                                            .background(.ultraThinMaterial)
+                                            .clipShape(Circle())
+                                            .padding(6)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(12)
+                    }
+                }
+
+                HStack(spacing: 12) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.primary)
+                            .frame(width: 64, height: 50)
+                            .background(Color(UIColor.secondarySystemGroupedBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
+
+                    Button {
+                        vm.commitBatchDeletion {
+                            dismiss()
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "trash")
+                            Text("(\(vm.trashAssets.count))")
+                                .fontWeight(.semibold)
+                        }
+                        .foregroundColor(vm.trashAssets.isEmpty ? .secondary : .red)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 50)
+                        .background(Color(UIColor.secondarySystemGroupedBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
+                    .disabled(vm.trashAssets.isEmpty)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(Color(UIColor.systemGroupedBackground))
+            }
+            .navigationTitle("待删除")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .foregroundColor(.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 设置弹窗（左上角齿轮 ⚙️，简洁无广告）
+struct SettingsSheetView: View {
+    @ObservedObject var vm: PhotoCleanerViewModel
+    @AppStorage("isDarkMode") private var isDarkMode: Bool = false
+    @Environment(\.dismiss) private var dismiss
+    @State private var showResetConfirm: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("浏览方式")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+
+                HStack(spacing: 10) {
+                    ForEach(SortOrder.allCases) { order in
+                        let isSelected = (vm.sortOrder == order)
+                        Button {
+                            vm.sortOrder = order
+                            Task {
+                                await vm.reloadCurrentAlbumAssets()
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: order.icon)
+                                Text(order.rawValue)
+                                    .fontWeight(.medium)
+                            }
+                            .font(.subheadline)
+                            .foregroundColor(isSelected ? Color(UIColor.systemBackground) : .primary)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 44)
+                            .background(isSelected ? Color.primary : Color(UIColor.secondarySystemGroupedBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                }
+
+                HStack {
+                    Image(systemName: "eye.slash")
+                        .font(.system(size: 18))
+                        .frame(width: 28)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("仅看未整理的图片")
+                            .font(.body.weight(.medium))
+                        HStack(spacing: 4) {
+                            Text("还有 \(vm.unorganizedTotalCount) 张未整理 ·")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Button("重置") {
+                                showResetConfirm = true
+                            }
+                            .font(.caption.weight(.semibold))
+                        }
+                    }
+
+                    Spacer()
+
+                    Toggle("", isOn: $vm.onlyUnorganized)
+                        .labelsHidden()
+                        .onChange(of: vm.onlyUnorganized) { _ in
+                            Task {
+                                await vm.reloadCurrentAlbumAssets()
+                            }
+                        }
+                }
+                .padding(16)
+                .background(Color(UIColor.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                Spacer()
+            }
+            .padding(20)
+            .background(Color(UIColor.systemGroupedBackground))
+            .navigationTitle("设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .confirmationDialog("确定要重置所有已整理记录吗？", isPresented: $showResetConfirm, titleVisibility: .visible) {
+                Button("重置进度", role: .destructive) {
+                    vm.resetOrganizedHistory()
+                }
+                Button("取消", role: .cancel) {}
+            }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        isDarkMode.toggle()
+                    } label: {
+                        Image(systemName: isDarkMode ? "sun.max.fill" : "moon")
+                            .foregroundColor(.primary)
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .foregroundColor(.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 相册网格总览与相册切换器（右上角文件夹 🗂️）
+struct AlbumOverviewSheetView: View {
+    @ObservedObject var vm: PhotoCleanerViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showAlbumPicker = false
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 3),
+        GridItem(.flexible(), spacing: 3),
+        GridItem(.flexible(), spacing: 3)
+    ]
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                HStack {
+                    Button {
+                        showAlbumPicker = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "folder")
+                            Text(vm.selectedAlbum?.title ?? "全部相册")
+                                .fontWeight(.semibold)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption)
+                        }
+                        .foregroundColor(.primary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Color(UIColor.secondarySystemGroupedBackground))
+                        .clipShape(Capsule())
+                    }
+
+                    Spacer()
+
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.primary)
+                            .frame(width: 40, height: 40)
+                            .background(Color(UIColor.secondarySystemGroupedBackground))
+                            .clipShape(Circle())
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVGrid(columns: columns, spacing: 3) {
+                            ForEach(Array(vm.displayAssets.enumerated()), id: \.element.localIdentifier) { index, asset in
+                                AssetThumbnailView(asset: asset, size: CGSize(width: 130, height: 130))
+                                    .frame(height: 125)
+                                    .clipped()
+                                    .id(asset.localIdentifier)
+                                    .onTapGesture {
+                                        vm.jumpToAsset(at: index)
+                                        dismiss()
+                                    }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        if let currentID = vm.currentAsset?.localIdentifier {
+                            proxy.scrollTo(currentID, anchor: .center)
+                        }
+                    }
+                }
+            }
+            .background(Color(UIColor.systemGroupedBackground))
+            .sheet(isPresented: $showAlbumPicker) {
+                AlbumPickerSheetView(vm: vm)
+            }
+        }
+    }
+}
+
+// MARK: - 选择相册列表弹窗（带真实相册封面缩略图与搜索）
+struct AlbumPickerSheetView: View {
+    @ObservedObject var vm: PhotoCleanerViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var searchText: String = ""
+
+    var filteredAlbums: [AlbumItem] {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return vm.albums
+        }
+        return vm.albums.filter { $0.title.localizedCaseInsensitiveContains(trimmed) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 12) {
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("搜索相册名称", text: $searchText)
+                    if !searchText.isEmpty {
+                        Button {
+                            searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Color(UIColor.secondarySystemGroupedBackground))
+                .clipShape(Capsule())
+                .padding(.horizontal, 16)
+
+                List(filteredAlbums) { album in
+                    Button {
+                        vm.selectedAlbum = album
+                        Task {
+                            await vm.reloadCurrentAlbumAssets()
+                        }
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 14) {
+                            if let cover = album.coverAsset {
+                                AssetThumbnailView(asset: cover, size: CGSize(width: 52, height: 52))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            } else {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Color.secondary.opacity(0.18))
+                                    .frame(width: 52, height: 52)
+                                    .overlay(
+                                        Image(systemName: "photo.on.rectangle")
+                                            .foregroundColor(.secondary)
+                                    )
+                            }
+
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(album.title)
+                                    .font(.body.weight(.medium))
+                                    .foregroundColor(.primary)
+                                Text("\(album.count) 个项目")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                if let sub = album.subtitle {
+                                    Text(sub)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+
+                            Spacer()
+
+                            if vm.selectedAlbum?.id == album.id {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.primary)
+                                    .fontWeight(.semibold)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+                .listStyle(.plain)
+            }
+            .navigationTitle("选择相册")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .foregroundColor(.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 缩略图异步安全加载组件（自动取消旧请求，防止串图或内存泄漏）
+struct AssetThumbnailView: View {
+    let asset: PHAsset
+    let size: CGSize
+    @State private var image: UIImage?
+    @State private var requestID: PHImageRequestID = PHInvalidImageRequestID
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if let img = image {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size.width, height: size.height)
+                    .clipped()
+            } else {
+                Color.secondary.opacity(0.15)
+                    .frame(width: size.width, height: size.height)
+            }
+
+            if asset.mediaType == .video {
+                Image(systemName: "video.fill")
+                    .font(.system(size: 10))
+                    .foregroundColor(.white)
+                    .padding(4)
+                    .shadow(radius: 2)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .onAppear {
+            loadThumbnail()
+        }
+        .onDisappear {
+            cancelRequest()
+        }
+    }
+
+    private func loadThumbnail() {
+        cancelRequest()
+        let targetAssetID = asset.localIdentifier
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+
+        let scale = min(UIScreen.main.scale, 2.0)
+        let target = CGSize(width: size.width * scale, height: size.height * scale)
+
+        requestID = PHImageManager.default().requestImage(
+            for: asset,
+            targetSize: target,
+            contentMode: .aspectFill,
+            options: options
+        ) { result, _ in
+            guard let result = result, targetAssetID == asset.localIdentifier else { return }
+            DispatchQueue.main.async {
+                self.image = result
+            }
+        }
+    }
+
+    private func cancelRequest() {
+        if requestID != PHInvalidImageRequestID {
+            PHImageManager.default().cancelImageRequest(requestID)
+            requestID = PHInvalidImageRequestID
+        }
+    }
+}
+
+// MARK: - 主卡片大图/视频预览组件（支持双指放大看细节与视频播放）
+struct AssetDetailCardContent: View {
+    let asset: PHAsset
+    @State private var image: UIImage?
+    @State private var player: AVPlayer?
+    @State private var requestID: PHImageRequestID = PHInvalidImageRequestID
+    @State private var zoomScale: CGFloat = 1.0
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topTrailing) {
+                if asset.mediaType == .video, let player = player {
+                    VideoPlayer(player: player)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .onAppear { player.play() }
+                        .onDisappear { player.pause() }
+                } else if let img = image {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFit()
+                        .scaleEffect(zoomScale)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .gesture(
+                            MagnificationGesture()
+                                .onChanged { val in
+                                    zoomScale = max(1.0, min(val, 4.0))
+                                }
+                                .onEnded { _ in
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                        zoomScale = 1.0
+                                    }
+                                }
+                        )
+                } else {
+                    ProgressView()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+
+                if asset.mediaSubtypes.contains(.photoLive) {
+                    Label("实况", systemImage: "livephoto")
+                        .font(.caption2.weight(.medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.ultraThinMaterial)
+                        .clipShape(Capsule())
+                        .padding(12)
+                }
+            }
+            .onAppear {
+                loadMedia(for: asset, containerSize: geo.size)
+            }
+            .onChange(of: asset.localIdentifier) { _ in
+                zoomScale = 1.0
+                image = nil
+                player?.pause()
+                player = nil
+                loadMedia(for: asset, containerSize: geo.size)
+            }
+            .onDisappear {
+                player?.pause()
+                cancelRequest()
+            }
+        }
+    }
+
+    private func loadMedia(for targetAsset: PHAsset, containerSize: CGSize) {
+        cancelRequest()
+        let expectedID = targetAsset.localIdentifier
+
+        if targetAsset.mediaType == .video {
+            let vOptions = PHVideoRequestOptions()
+            vOptions.isNetworkAccessAllowed = true
+            vOptions.deliveryMode = .automatic
+            PHImageManager.default().requestPlayerItem(forVideo: targetAsset, options: vOptions) { item, _ in
+                guard let item = item, targetAsset.localIdentifier == expectedID else { return }
+                DispatchQueue.main.async {
+                    self.player = AVPlayer(playerItem: item)
+                }
+            }
+        }
+
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.isNetworkAccessAllowed = true
+        let scale = UIScreen.main.scale
+        let target = CGSize(
+            width: max(1000, containerSize.width * scale),
+            height: max(1000, containerSize.height * scale)
+        )
+
+        requestID = PHImageManager.default().requestImage(
+            for: targetAsset,
+            targetSize: target,
+            contentMode: .aspectFit,
+            options: options
+        ) { result, _ in
+            guard let result = result, targetAsset.localIdentifier == expectedID else { return }
+            DispatchQueue.main.async {
+                self.image = result
+            }
+        }
+    }
+
+    private func cancelRequest() {
+        if requestID != PHInvalidImageRequestID {
+            PHImageManager.default().cancelImageRequest(requestID)
+            requestID = PHInvalidImageRequestID
+        }
+    }
+}
